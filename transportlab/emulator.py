@@ -54,24 +54,44 @@ DEFAULTS = dict(
 
 
 class LinkEmulator:
+    """One shared bottleneck between one or more (client, server) flow pairs.
+
+    Loss / corruption / delay / reordering are applied per segment.  The rate
+    shaper and its finite buffer act on the *aggregate* of every flow in a
+    direction -- that shared queue is what makes multiple flows compete, and is
+    what the Arena view visualises.
+    """
+
     def __init__(
         self,
         link_addr: Addr,
-        client_addr: Addr,
-        server_addr: Addr,
+        flows,                       # list[(client_addr, server_addr)]
         bus: EventBus,
         config: Optional[dict] = None,
         seed: Optional[int] = None,
+        capture: bool = False,
     ) -> None:
         self.link_addr = link_addr
-        self.client_addr = client_addr
-        self.server_addr = server_addr
+        self.flows = list(flows)
+        # routing table: any endpoint addr -> (peer addr, direction, flow id)
+        self._route: dict = {}
+        self._route_by_port: dict = {}
+        for fid, (c, s) in enumerate(self.flows):
+            self._route[c] = (s, "up", fid)
+            self._route[s] = (c, "down", fid)
+            self._route_by_port[c[1]] = (s, "up", fid)
+            self._route_by_port[s[1]] = (c, "down", fid)
         self.bus = bus
         self.cfg = dict(DEFAULTS)
         if config:
             self.cfg.update(config)
         self._rnd = random.Random(seed)
         self._lock = threading.Lock()
+
+        # optional packet capture for pcap export: (t, src_ip_port, dst_ip_port, raw)
+        self.capture = capture
+        self._cap: list = []
+        self._cap_cap = 120_000
 
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -133,12 +153,21 @@ class LinkEmulator:
                 continue
             except OSError:
                 break
-            if src[1] == self.server_addr[1]:
-                direction, dst = "down", self.client_addr
-            else:
-                direction, dst = "up", self.server_addr
-                self.client_addr = src
-            self._handle(raw, direction, dst)
+            route = self._route.get(src) or self._route_by_port.get(src[1])
+            if route is None:
+                continue                     # unknown endpoint
+            dst, direction, fid = route
+            self._handle(raw, direction, dst, fid, src)
+
+    def _record(self, t: float, src: Addr, dst: Addr, raw: bytes) -> None:
+        if not self.capture:
+            return
+        self._cap.append((t, src, dst, raw))
+        if len(self._cap) > self._cap_cap:
+            del self._cap[: len(self._cap) - self._cap_cap]
+
+    def capture_packets(self) -> list:
+        return list(self._cap)
 
     def _peek(self, raw: bytes):
         try:
@@ -146,7 +175,7 @@ class LinkEmulator:
         except (ChecksumError, ValueError):
             return None
 
-    def _handle(self, raw: bytes, direction: str, dst: Addr) -> None:
+    def _handle(self, raw: bytes, direction: str, dst: Addr, fid: int, src: Addr) -> None:
         cfg = self.get_config()
         pkt = self._peek(raw)
         seq = pkt.seq if pkt else -1
@@ -166,24 +195,25 @@ class LinkEmulator:
 
         if not control and loss_p > 0 and self._rnd.random() < loss_p:
             self.counts["drop_loss"] += 1
-            self.bus.publish("link_drop", dir=direction, seq=seq, ptype=kind,
-                             reason="burst" if in_burst else "loss")
+            self.bus.publish("link_drop", flow=fid, dir=direction, seq=seq,
+                             ptype=kind, reason="burst" if in_burst else "loss")
             return
 
         # --- fluid-queue shaper: adds queueing delay, tail-drops when full ---
+        # NOTE: the backlog and buffer are shared across every flow -- that is
+        # the shared bottleneck the Arena view is all about.
         queue_delay = 0.0
         size = len(raw)
         if cfg["rate_kbps"] > 0:
             rate_bps = cfg["rate_kbps"] * 1000.0 / 8.0
             with self._lock:
-                # drain the backlog by however long it has been since last time
                 self._queue_bytes = max(
                     0.0, self._queue_bytes - (now - self._last_drain) * rate_bps)
                 self._last_drain = now
                 if (cfg["buffer_bytes"]
                         and self._queue_bytes + size > cfg["buffer_bytes"]):
                     self.counts["drop_buffer"] += 1
-                    self.bus.publish("link_drop", dir=direction, seq=seq,
+                    self.bus.publish("link_drop", flow=fid, dir=direction, seq=seq,
                                      ptype=kind, reason="buffer_overflow")
                     return
                 queue_delay = self._queue_bytes / rate_bps   # wait behind backlog
@@ -197,9 +227,8 @@ class LinkEmulator:
             b[self._rnd.randrange(len(b))] ^= 1 << self._rnd.randrange(8)
             out = bytes(b)
             self.counts["corrupted"] += 1
-            # The bytes are still forwarded; the receiver's checksum will reject
-            # them and emit rx_drop(reason="checksum").
-            self.bus.publish("link_corrupt", dir=direction, seq=seq, ptype=kind)
+            self.bus.publish("link_corrupt", flow=fid, dir=direction, seq=seq,
+                             ptype=kind)
 
         # --- delay: base + jitter (+ a big extra shove if reordered) ---
         delay = cfg["latency_ms"] / 1000.0
@@ -218,17 +247,19 @@ class LinkEmulator:
             self._last_deliver[direction] = deliver_at
 
         dup = (not control and cfg["dup"] > 0 and self._rnd.random() < cfg["dup"])
-        self.bus.publish("link_fwd", dir=direction, seq=seq, ptype=kind,
+        self.bus.publish("link_fwd", flow=fid, dir=direction, seq=seq, ptype=kind,
                          delay_ms=round((deliver_at - now) * 1000, 1), dup=dup)
-        self._enqueue(deliver_at, out, dst, size)
+        self._enqueue(deliver_at, out, dst, size, src)
         if dup:
             self.counts["duplicated"] += 1
-            self._enqueue(deliver_at + 5e-4, out, dst, size)
+            self._enqueue(deliver_at + 5e-4, out, dst, size, src)
 
     # -- transmit side -------------------------------------------------
-    def _enqueue(self, deliver_at: float, data: bytes, dst: Addr, size: int) -> None:
+    def _enqueue(self, deliver_at: float, data: bytes, dst: Addr, size: int,
+                 src: Addr) -> None:
         with self._cv:
-            heapq.heappush(self._heap, (deliver_at, next(self._seq), data, dst, size))
+            heapq.heappush(self._heap,
+                           (deliver_at, next(self._seq), data, dst, size, src))
             self._cv.notify()
 
     def _tx_loop(self) -> None:
@@ -243,9 +274,10 @@ class LinkEmulator:
                 if wait > 0:
                     self._cv.wait(timeout=min(wait, 0.25))
                     continue
-                _, _, data, dst, size = heapq.heappop(self._heap)
+                _, _, data, dst, size, src = heapq.heappop(self._heap)
             try:
                 self._sock.sendto(data, dst)
                 self.counts["fwd"] += 1
+                self._record(time.time(), src, dst, data)
             except OSError:
                 pass

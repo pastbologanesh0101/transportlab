@@ -2,20 +2,26 @@
 
 PY ?= python3
 
-.PHONY: run demo headless test clean
+.PHONY: run arena mux sweep headless test clean
 
-run:            ## launch the dashboard (http://127.0.0.1:8080)
+run:            ## dashboard at http://127.0.0.1:8080
 	$(PY) run.py
 
-demo:           ## dashboard preloaded with the satellite scenario
-	$(PY) run.py --preset satellite --arq selective_repeat --cc cubic --size 2
+arena:          ## dashboard: Reno vs CUBIC vs BBR over one bottleneck
+	$(PY) run.py --flows 3 --flow-cc reno,cubic,bbr --preset transoceanic --size 2
 
-headless:       ## one head-less transfer, prints a JSON summary
-	$(PY) run.py --auto --preset wifi_cafe --arq selective_repeat --cc reno --size 1
+mux:            ## dashboard: 4 QUIC-style streams on a burst-loss link
+	$(PY) run.py --mux 4 --preset mobile_handoff --size 2
 
-test:           ## wire-format + end-to-end loopback tests
+sweep:          ## head-less loss sweep vs the Mathis model
+	$(PY) run.py --sweep --cc reno --preset wifi_cafe --size 0.3
+
+headless:       ## one head-less transfer, prints JSON
+	$(PY) run.py --auto --preset wifi_cafe --cc reno --size 1
+
+test:           ## wire format + loopback + arena tests
 	$(PY) -m unittest discover -s tests -v
 
 clean:
-	rm -f sample/source.bin sample/received.bin
+	rm -f sample/*.bin sample/*.png sample/*.jpg
 	find . -name __pycache__ -type d -exec rm -rf {} +

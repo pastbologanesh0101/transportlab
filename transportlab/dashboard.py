@@ -21,6 +21,7 @@ import json
 import os
 import queue
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -82,6 +83,11 @@ def make_server(session: Session, bus: EventBus, web_dir: str,
                 return self._export_csv()
             if path == "/export.jsonl":
                 return self._export_jsonl()
+            if path == "/export.pcap":
+                data = session.pcap_bytes()
+                return self._send(200, data, "application/vnd.tcpdump.pcap",
+                                  {"Content-Disposition":
+                                   "attachment; filename=transportlab.pcap"})
             if path.startswith("/") and ".." not in path:
                 return self._asset(path.lstrip("/"))
             self._send(404, b"not found", "text/plain")
@@ -165,6 +171,11 @@ def make_server(session: Session, bus: EventBus, web_dir: str,
                     else:
                         session.start()
                     return self._json({"running": session.running})
+                if path == "/sweep":
+                    cc = body.get("cc")
+                    threading.Thread(target=session.run_sweep,
+                                     kwargs={"cc": cc}, daemon=True).start()
+                    return self._json({"started": True})
             except (KeyError, ValueError, TypeError) as e:
                 return self._json({"error": str(e)}, code=400)
             self._send(404, b"not found", "text/plain")

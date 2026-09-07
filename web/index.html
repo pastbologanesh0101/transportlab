@@ -12,13 +12,13 @@
     <span class="logo">◆</span>
     <div>
       <h1>TransportLab</h1>
-      <p>a reliable transport protocol, built on UDP, made visible</p>
+      <p>a reliable transport protocol, and a congestion-control arena, on top of UDP</p>
     </div>
   </div>
   <div class="run">
     <span id="status" class="pill idle">idle</span>
     <span id="verify" class="pill hidden"></span>
-    <button id="btn-start" class="primary">▶ Start transfer</button>
+    <button id="btn-start" class="primary">▶ Start</button>
     <button id="btn-stop" class="ghost">■ Stop</button>
   </div>
 </header>
@@ -34,19 +34,46 @@
         <option value="selective_repeat" selected>Selective Repeat</option>
       </select>
     </label>
-    <label>Congestion control
+    <label id="cc-single">Congestion control
       <select id="p-cc">
         <option value="none">none (flow control only)</option>
         <option value="tahoe">TCP Tahoe</option>
         <option value="reno" selected>TCP Reno</option>
-        <option value="cubic">CUBIC (simplified)</option>
+        <option value="cubic">CUBIC</option>
+        <option value="bbr">BBR</option>
       </select>
     </label>
     <div class="row">
       <label>Size (MB)<input id="p-size" type="number" min="0.05" step="0.05" value="2"></label>
-      <label>rwnd (seg)<input id="p-rwnd" type="number" min="1" step="1" value="64"></label>
-      <label>MSS (B)<input id="p-mss" type="number" min="64" step="64" value="1024"></label>
+      <label>rwnd<input id="p-rwnd" type="number" min="1" step="1" value="64"></label>
+      <label>MSS<input id="p-mss" type="number" min="64" step="64" value="1024"></label>
     </div>
+
+    <h2>Arena <span class="hint">flows share one bottleneck</span></h2>
+    <label>Competing flows
+      <select id="p-flows">
+        <option value="1" selected>1 — single flow</option>
+        <option value="2">2 flows</option>
+        <option value="3">3 flows</option>
+        <option value="4">4 flows</option>
+      </select>
+    </label>
+    <div id="flow-cc" class="flow-cc hidden"></div>
+    <label id="stagger-wrap" class="hidden">Stagger (s between starts)
+      <input id="p-stagger" type="number" min="0" step="0.5" value="2">
+    </label>
+
+    <h2>QUIC multiplexing <span class="hint">one flow, many streams</span></h2>
+    <label>Logical streams
+      <select id="p-mux">
+        <option value="1" selected>1 — plain</option>
+        <option value="2">2 streams</option>
+        <option value="4">4 streams</option>
+        <option value="8">8 streams</option>
+      </select>
+    </label>
+    <label class="chk"><input type="checkbox" id="p-hol">
+      head-of-line blocking (one TCP byte stream)</label>
 
     <h2>Link presets</h2>
     <div id="presets" class="presets"></div>
@@ -54,10 +81,25 @@
     <h2>Link impairments <span class="hint">live</span></h2>
     <div id="sliders"></div>
 
+    <h2>Lab</h2>
+    <div class="lab">
+      <label>Sweep CC
+        <select id="sw-cc">
+          <option value="reno" selected>Reno</option>
+          <option value="tahoe">Tahoe</option>
+          <option value="cubic">CUBIC</option>
+          <option value="bbr">BBR</option>
+        </select>
+      </label>
+      <button id="btn-sweep" class="ghost">Run loss sweep vs Mathis model</button>
+      <span id="sweep-note" class="hint"></span>
+    </div>
+
     <h2>Export</h2>
     <div class="export">
       <a href="/export.csv" download>events.csv</a>
       <a href="/export.jsonl" download>events.jsonl</a>
+      <a href="/export.pcap" download>capture.pcap</a>
       <button id="btn-png" class="ghost">charts.png</button>
     </div>
   </section>
@@ -75,17 +117,27 @@
       </div>
     </div>
     <canvas id="cv-ladder"></canvas>
+    <div id="fairness-wrap" class="fairness hidden">
+      <figcaption>Fairness <span id="fairness-cap"></span></figcaption>
+      <canvas id="cv-fair"></canvas>
+    </div>
   </section>
 
   <!-- ================= charts + stats ================= -->
   <section class="panel scope">
     <div class="stat-grid" id="stats"></div>
-    <figure><figcaption>Congestion window <span>cwnd · ssthresh · rwnd — segments</span></figcaption>
+    <figure><figcaption>Congestion window <span>cwnd per flow — segments</span></figcaption>
       <canvas id="cv-cwnd"></canvas></figure>
+    <figure id="fig-share" class="hidden"><figcaption>Bandwidth share <span>Mbps per flow, stacked</span></figcaption>
+      <canvas id="cv-share"></canvas></figure>
     <figure><figcaption>Goodput <span>Mbps delivered</span></figcaption>
       <canvas id="cv-tput"></canvas></figure>
-    <figure><figcaption>Round-trip time <span>sample · smoothed SRTT · RTO — ms</span></figcaption>
+    <figure id="fig-streams" class="hidden"><figcaption>Stream delivery <span>segments delivered per stream — a flat line is a stalled stream</span></figcaption>
+      <canvas id="cv-streams"></canvas></figure>
+    <figure><figcaption>Round-trip time <span>smoothed SRTT · RTO — ms</span></figcaption>
       <canvas id="cv-rtt"></canvas></figure>
+    <figure id="fig-sweep" class="hidden"><figcaption>Loss sweep <span>measured goodput vs Mathis √p model — kbps</span></figcaption>
+      <canvas id="cv-sweep"></canvas></figure>
   </section>
 </main>
 

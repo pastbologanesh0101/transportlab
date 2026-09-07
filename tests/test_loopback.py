@@ -4,6 +4,7 @@ intact, for every ARQ strategy and a couple of congestion controllers."""
 import itertools
 import os
 import sys
+import tempfile
 import threading
 import unittest
 
@@ -33,7 +34,7 @@ def run_once(arq, cc, link, size=120_000, seed=7):
     th = threading.Thread(target=pump, daemon=True)
     th.start()
 
-    session = Session(bus, port_base=next(PORT), seed=seed)
+    session = Session(bus, port_base=next(PORT), out_dir=tempfile.mkdtemp(prefix='tl_'), seed=seed)
     session.set_link(link)
     session.configure(arq=arq, cc=cc, rwnd=48, mss=1024, size_bytes=size)
     session.start(wait=True)
@@ -43,7 +44,7 @@ def run_once(arq, cc, link, size=120_000, seed=7):
 
     with open(os.path.join(session.out_dir, "source.bin"), "rb") as f:
         src = f.read()
-    with open(os.path.join(session.out_dir, "received.bin"), "rb") as f:
+    with open(os.path.join(session.out_dir, "received_0.bin"), "rb") as f:
         dst = f.read()
     session.shutdown()
     return got, src, dst

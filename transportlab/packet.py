@@ -71,7 +71,7 @@ class ChecksumError(ValueError):
 
 
 class Packet:
-    __slots__ = ("flags", "seq", "ack", "window", "sacks", "payload")
+    __slots__ = ("flags", "seq", "ack", "window", "sacks", "payload", "stream")
 
     def __init__(
         self,
@@ -81,6 +81,7 @@ class Packet:
         window: int = 0,
         sacks: List[int] | None = None,
         payload: bytes = b"",
+        stream: int = 0,
     ) -> None:
         self.flags = flags
         self.seq = seq
@@ -88,6 +89,7 @@ class Packet:
         self.window = window
         self.sacks = list(sacks or [])[:MAX_SACK]
         self.payload = payload
+        self.stream = stream & 0xFF
 
     # -- helpers -------------------------------------------------------------
     def has(self, bit: int) -> bool:
@@ -115,12 +117,12 @@ class Packet:
         body = sack_bytes + self.payload
         blank = _HDR.pack(
             MAGIC, VERSION, self.flags, self.seq, self.ack, self.window,
-            len(self.sacks), 0, 0, len(self.payload),
+            len(self.sacks), self.stream, 0, len(self.payload),
         )
         cksum = internet_checksum(blank + body)
         header = _HDR.pack(
             MAGIC, VERSION, self.flags, self.seq, self.ack, self.window,
-            len(self.sacks), 0, cksum, len(self.payload),
+            len(self.sacks), self.stream, cksum, len(self.payload),
         )
         return header + body
 
@@ -128,7 +130,7 @@ class Packet:
     def decode(cls, raw: bytes) -> "Packet":
         if len(raw) < HDR_LEN:
             raise ValueError("segment shorter than header")
-        magic, ver, flags, seq, ack, window, sack_n, _res, cksum, plen = _HDR.unpack(
+        magic, ver, flags, seq, ack, window, sack_n, stream, cksum, plen = _HDR.unpack(
             raw[:HDR_LEN]
         )
         if magic != MAGIC:
@@ -136,7 +138,7 @@ class Packet:
         if ver != VERSION:
             raise ValueError(f"unsupported version {ver}")
         body = raw[HDR_LEN:]
-        blank = _HDR.pack(magic, ver, flags, seq, ack, window, sack_n, 0, 0, plen)
+        blank = _HDR.pack(magic, ver, flags, seq, ack, window, sack_n, stream, 0, plen)
         if internet_checksum(blank + body) != cksum:
             raise ChecksumError("checksum mismatch")
         sacks = [
@@ -145,4 +147,4 @@ class Packet:
         payload = body[sack_n * 4 : sack_n * 4 + plen]
         if len(payload) != plen:
             raise ValueError("truncated payload")
-        return cls(flags, seq, ack, window, sacks, payload)
+        return cls(flags, seq, ack, window, sacks, payload, stream)

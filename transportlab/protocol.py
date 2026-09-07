@@ -62,6 +62,10 @@ class Connection:
         rwnd: int = 64,
         mss: int = 1024,
         stop_flag=None,
+        flow_id: int = 0,
+        label: str = "",
+        mux: int = 1,
+        hol: bool = False,
     ) -> None:
         self.role = role
         self.sock = sock
@@ -69,10 +73,21 @@ class Connection:
         self.bus = bus
         self.arq = arq
         self.mss = mss
+        self.mux = max(1, int(mux))        # number of logical streams (QUIC-style)
+        self.hol = bool(hol)              # True == one byte stream (TCP-style HoL)
         self.rwnd_self = rwnd          # what we advertise to the peer
         self.cc = make_cc(cc)
+        self.cc_name = cc
         self.stop_flag = stop_flag
+        self.flow_id = flow_id
+        self.label = label or f"flow {flow_id}"
         self.sock.setblocking(False)
+
+        # delivery-rate estimate (bytes/s) averaged over ~1 RTT, for
+        # model-based congestion control such as BBR
+        self.delivery_rate = 0.0
+        self._total_acked = 0
+        self._deliv: List[tuple] = []   # (t, cumulative acked bytes)
 
         # RTT / RTO estimator
         self.srtt: Optional[float] = None
@@ -110,6 +125,9 @@ class Connection:
         self.finished = False
         self._recv_hash = hashlib.sha256()
         self._last_progress = 0.0
+        self._arrived: Set[int] = set()        # every DATA seq seen (for mux viz)
+        self._stream_seg = [0] * self.mux      # per-stream contiguous prefix
+        self._stream_emitted = [0] * self.mux
 
         # counters (both roles)
         self.stat = dict(retransmits=0, timeouts=0, fast_retx=0, dupacks=0,
@@ -118,13 +136,17 @@ class Connection:
     # ================================================================
     #  helpers
     # ================================================================
+    def _ev(self, kind: str, **data) -> dict:
+        """Publish a telemetry event, tagged with this flow's id."""
+        return self.bus.publish(kind, flow=self.flow_id, **data)
+
     def _send(self, pkt: Packet, who: str) -> None:
         try:
             self.sock.sendto(pkt.encode(), self.link_addr)
         except OSError:
             return
-        self.bus.publish("tx", who=who, seq=pkt.seq, ack=pkt.ack,
-                         ptype=pkt.kind, retransmit=False)
+        self._ev("tx", who=who, seq=pkt.seq, ack=pkt.ack,
+                 ptype=pkt.kind, retransmit=False)
 
     def _rtt_sample(self, r: float) -> None:
         if self.srtt is None:
@@ -135,7 +157,7 @@ class Connection:
         # RFC 6298: RTO = SRTT + max(G, 4*RTTVAR), then clamp.
         self.rto = min(max(self.srtt + max(CLOCK_G, 4.0 * self.rttvar),
                            MIN_RTO), MAX_RTO)
-        self.bus.publish("rtt", sample_ms=round(r * 1000, 2),
+        self._ev("rtt", sample_ms=round(r * 1000, 2),
                          srtt_ms=round(self.srtt * 1000, 2),
                          rttvar_ms=round(self.rttvar * 1000, 2),
                          rto_ms=round(self.rto * 1000, 2))
@@ -143,7 +165,7 @@ class Connection:
     def _emit_cwnd(self) -> None:
         d = self.cc.as_dict()
         self.stat["max_cwnd"] = max(self.stat["max_cwnd"], d["cwnd"])
-        self.bus.publish("cwnd", **d, rwnd=self.rwnd_peer,
+        self._ev("cwnd", **d, rwnd=self.rwnd_peer,
                          inflight=self._inflight())
 
     def _inflight(self) -> int:
@@ -167,12 +189,12 @@ class Connection:
         self.chunks = [data[i : i + self.mss] for i in range(0, len(data), self.mss)] or [b""]
         self.N = len(self.chunks)
         self.file_digest = hashlib.sha256(data).digest()
-        self.bus.publish("hello", role="client", arq=self.arq, cc=self.cc.name,
+        self._ev("hello", role="client", arq=self.arq, cc=self.cc.name,
                          segments=self.N, bytes=len(data), mss=self.mss,
                          rwnd=self.rwnd_self)
 
         if not self._handshake_client():
-            self.bus.publish("close", role="client", reason="handshake_failed")
+            self._ev("close", role="client", reason="handshake_failed")
             return
 
         self._emit_cwnd()
@@ -198,7 +220,7 @@ class Connection:
                         break
 
         self._emit_client_stats()
-        self.bus.publish("close", role="client", reason="done")
+        self._ev("close", role="client", reason="done")
 
     def _handshake_client(self) -> bool:
         rto = 0.5
@@ -219,7 +241,7 @@ class Connection:
                 self.rwnd_peer = pkt.window or self.rwnd_peer
                 self._send(Packet(FLAG_ACK, seq=1, ack=pkt.seq + 1,
                                   window=self.rwnd_self), "client")
-                self.bus.publish("handshake", role="client", state="established",
+                self._ev("handshake", role="client", state="established",
                                  rwnd_peer=self.rwnd_peer)
                 return True
         return False
@@ -232,7 +254,7 @@ class Connection:
 
     def _transmit(self, seq: int, *, retx: bool, reason: str = "") -> None:
         pkt = Packet(FLAG_DATA, seq=seq, ack=0, window=self.rwnd_self,
-                     payload=self.chunks[seq])
+                     payload=self.chunks[seq], stream=seq % self.mux)
         try:
             self.sock.sendto(pkt.encode(), self.link_addr)
         except OSError:
@@ -247,10 +269,10 @@ class Connection:
             self.stat["retransmits"] += 1
             if reason == "fast":
                 self.stat["fast_retx"] += 1
-            self.bus.publish("retransmit", seq=seq, reason=reason)
+            self._ev("retransmit", seq=seq, reason=reason)
         else:
             self.send_ts[seq] = now
-        self.bus.publish("tx", who="client", seq=seq, ptype="DATA", retransmit=retx)
+        self._ev("tx", who="client", seq=seq, ptype="DATA", retransmit=retx)
         self._arm_timer(seq)
 
     def _arm_timer(self, seq: int) -> None:
@@ -296,7 +318,7 @@ class Connection:
         if pkt.has(FLAG_FIN):          # FIN-ACK for our teardown
             self.fin_acked = True
             return
-        self.bus.publish("rx", who="client", seq=pkt.seq, ack=pkt.ack, ptype="ACK")
+        self._ev("rx", who="client", seq=pkt.seq, ack=pkt.ack, ptype="ACK")
         self.rwnd_peer = pkt.window or self.rwnd_peer
 
         for s in pkt.sacks:
@@ -308,8 +330,22 @@ class Connection:
         now = MONO()
         if cum > self.snd_base:
             newly = cum - self.snd_base
+            sample = None
             if (cum - 1) in self.send_ts and (cum - 1) not in self.retx:
-                self._rtt_sample(now - self.send_ts[cum - 1])
+                sample = now - self.send_ts[cum - 1]
+                self._rtt_sample(sample)
+            # delivery rate (bytes/s), measured over a ~1 RTT window with a
+            # 30 ms floor so a burst of closely-spaced ACKs can't spike it
+            self._total_acked += newly * self.mss
+            if not self._deliv or now - self._deliv[-1][0] >= 0.005:
+                self._deliv.append((now, self._total_acked))
+            horizon = now - max(2.0 * (self.srtt or 0.1), 0.1)
+            while len(self._deliv) > 2 and self._deliv[0][0] < horizon:
+                self._deliv.pop(0)
+            t_old, b_old = self._deliv[0]
+            span = now - t_old
+            if span >= max(0.8 * (self.srtt or 0.1), 0.03):
+                self.delivery_rate = (self._total_acked - b_old) / span
             for s in range(self.snd_base, cum):
                 self.send_ts.pop(s, None)
                 self.sr_timers.pop(s, None)
@@ -330,15 +366,16 @@ class Connection:
             if self.srtt is not None:
                 self.rto = min(max(self.srtt + max(CLOCK_G, 4 * self.rttvar),
                                    MIN_RTO), 2.0)
-            self.cc.on_ack(newly)
+            self.cc.on_ack(newly, sample_rtt=sample or self.srtt,
+                           delivery_rate=self.delivery_rate, mss=self.mss)
             self._emit_cwnd()
-            self.bus.publish("ack", cum=cum, base=self.snd_base, next=self.snd_next)
+            self._ev("ack", cum=cum, base=self.snd_base, next=self.snd_next)
             if self.arq != "selective_repeat":
                 self.gbn_deadline = now + self.rto if self.snd_base < self.snd_next else None
         elif cum == self.snd_base and self.snd_base < self.snd_next:
             self.dupacks += 1
             self.stat["dupacks"] += 1
-            self.bus.publish("dupack", ack=cum, n=self.dupacks)
+            self._ev("dupack", ack=cum, n=self.dupacks)
             if self.dupacks == 3:
                 self._cc_loss("fast")
                 self._fast_retransmit()
@@ -409,7 +446,7 @@ class Connection:
             if real:
                 self.stat["timeouts"] += 1
                 self.rto = min(self.rto * 2.0, MAX_RTO)
-                self.bus.publish("rto", scope="sr", count=len(real),
+                self._ev("rto", scope="sr", count=len(real),
                                  rto_ms=round(self.rto * 1000, 2))
                 self._cc_loss("timeout")
                 for s in sorted(real):
@@ -418,7 +455,7 @@ class Connection:
             if self.gbn_deadline is not None and now >= self.gbn_deadline:
                 self.stat["timeouts"] += 1
                 self.rto = min(self.rto * 2.0, MAX_RTO)
-                self.bus.publish("rto", scope="gbn",
+                self._ev("rto", scope="gbn",
                                  rto_ms=round(self.rto * 1000, 2))
                 self._cc_loss("timeout")
                 for s in range(self.snd_base, self.snd_next):
@@ -432,14 +469,14 @@ class Connection:
         self._send(Packet(FLAG_FIN, seq=self.N, window=self.rwnd_self,
                           payload=self.file_digest), "client")
         if resend:
-            self.bus.publish("retransmit", seq=self.N, reason="fin")
+            self._ev("retransmit", seq=self.N, reason="fin")
 
     def _emit_client_stats(self) -> None:
         start = self._first_data_t or MONO()
         end = self._last_ack_t or MONO()
         secs = max(end - start, 1e-6)
         total = sum(len(c) for c in self.chunks)
-        self.bus.publish(
+        self._ev(
             "stats", role="client",
             bytes=total, seconds=round(secs, 3),
             goodput_kbps=round(total * 8 / secs / 1000, 1),
@@ -458,7 +495,7 @@ class Connection:
     # ================================================================
     def recv_file(self, on_deliver: Callable[[bytes], None]) -> None:
         self.on_deliver = on_deliver
-        self.bus.publish("hello", role="server", arq=self.arq, rwnd=self.rwnd_self)
+        self._ev("hello", role="server", arq=self.arq, rwnd=self.rwnd_self)
         while not self._stopping():
             try:
                 ready, _, _ = select.select([self.sock], [], [], 0.3)
@@ -475,7 +512,7 @@ class Connection:
                     if r:
                         self._drain_socket_server()
                 break
-        self.bus.publish("close", role="server", reason="done")
+        self._ev("close", role="server", reason="done")
 
     def _drain_socket_server(self) -> None:
         while True:
@@ -489,7 +526,7 @@ class Connection:
                 pkt = Packet.decode(raw)
             except ChecksumError:
                 self.stat["corrupt_rx"] += 1
-                self.bus.publish("rx_drop", who="server", reason="checksum")
+                self._ev("rx_drop", who="server", reason="checksum")
                 continue
             except ValueError:
                 continue
@@ -512,7 +549,7 @@ class Connection:
             self.link_addr = src
             self._send(Packet(FLAG_SYN | FLAG_ACK, seq=0, ack=pkt.seq + 1,
                               window=self.rwnd_self), "server")
-            self.bus.publish("handshake", role="server", state="syn_received")
+            self._ev("handshake", role="server", state="syn_received")
             return
 
         if pkt.has(FLAG_FIN):
@@ -524,10 +561,13 @@ class Connection:
             return
 
         if pkt.has(FLAG_DATA):
-            self.bus.publish("rx", who="server", seq=pkt.seq, ptype="DATA")
+            self._ev("rx", who="server", seq=pkt.seq, ptype="DATA")
+            if self.mux > 1:
+                self._arrived.add(pkt.seq)
             self._accept(pkt.seq, pkt.payload)
             self._send(self._ack_packet(), "server")
             self._maybe_progress()
+            self._stream_progress()
 
     def _accept(self, seq: int, payload: bytes) -> None:
         if self.arq == "selective_repeat":
@@ -544,7 +584,7 @@ class Connection:
             if seq == self.rcv_next:
                 self._deliver(payload)
             else:
-                self.bus.publish("rx_drop", who="server", seq=seq,
+                self._ev("rx_drop", who="server", seq=seq,
                                  reason="out_of_order")
 
     def _deliver(self, payload: bytes) -> None:
@@ -558,16 +598,45 @@ class Connection:
         now = MONO()
         if now - self._last_progress >= 0.05:
             self._last_progress = now
-            self.bus.publish("progress", side="server", bytes=self.bytes_delivered,
+            self._ev("progress", side="server", bytes=self.bytes_delivered,
                              segments=self.rcv_next, buffered=len(self.rcv_buf))
+
+    def _stream_progress(self) -> None:
+        """Per-stream deliverable prefix, for the QUIC vs head-of-line demo.
+
+        QUIC (hol=False): a stream advances as soon as *its* next segment has
+        arrived, in any order -- a loss on one stream never stalls another.
+        TCP  (hol=True) : the whole connection is one byte stream, so a
+        stream's data is only released once global in-order delivery reaches
+        it -- one lost segment freezes every stream.
+        """
+        if self.mux <= 1:
+            return
+        for s in range(self.mux):
+            nxt = s + self._stream_seg[s] * self.mux
+            if self.hol:
+                while nxt < self.rcv_next:
+                    self._stream_seg[s] += 1
+                    nxt += self.mux
+            else:
+                while nxt in self._arrived:
+                    self._stream_seg[s] += 1
+                    nxt += self.mux
+            # emit only when this stream actually moved, so the chart shows
+            # QUIC streams advancing independently vs HoL streams in lockstep
+            if self._stream_seg[s] != self._stream_emitted[s]:
+                self._stream_emitted[s] = self._stream_seg[s]
+                self._ev("stream_progress", stream=s,
+                         segments=self._stream_seg[s],
+                         bytes=self._stream_seg[s] * self.mss)
 
     def _finalise(self) -> None:
         self.finished = True
         recv_digest = self._recv_hash.digest()
         ok = self.peer_digest == recv_digest
-        self.bus.publish("progress", side="server", bytes=self.bytes_delivered,
+        self._ev("progress", side="server", bytes=self.bytes_delivered,
                          segments=self.rcv_next, buffered=len(self.rcv_buf))
-        self.bus.publish(
+        self._ev(
             "verify", ok=bool(ok), bytes=self.bytes_delivered,
             segments=self.rcv_next,
             sent_sha256=(self.peer_digest or b"").hex(),
