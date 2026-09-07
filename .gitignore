@@ -1,0 +1,15 @@
+# generated at run time
+sample/*.bin
+sample/*.jpg
+sample/*.png
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# editors / os
+.DS_Store
+.idea/
+.vscode/

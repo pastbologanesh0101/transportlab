@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TransportLab</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <div class="brand">
+    <span class="logo">◆</span>
+    <div>
+      <h1>TransportLab</h1>
+      <p>a reliable transport protocol, built on UDP, made visible</p>
+    </div>
+  </div>
+  <div class="run">
+    <span id="status" class="pill idle">idle</span>
+    <span id="verify" class="pill hidden"></span>
+    <button id="btn-start" class="primary">▶ Start transfer</button>
+    <button id="btn-stop" class="ghost">■ Stop</button>
+  </div>
+</header>
+
+<main>
+  <!-- ================= controls ================= -->
+  <section class="panel controls">
+    <h2>Protocol <span class="hint">applies on next run</span></h2>
+    <label>ARQ strategy
+      <select id="p-arq">
+        <option value="stop_and_wait">Stop &amp; Wait</option>
+        <option value="go_back_n">Go-Back-N</option>
+        <option value="selective_repeat" selected>Selective Repeat</option>
+      </select>
+    </label>
+    <label>Congestion control
+      <select id="p-cc">
+        <option value="none">none (flow control only)</option>
+        <option value="tahoe">TCP Tahoe</option>
+        <option value="reno" selected>TCP Reno</option>
+        <option value="cubic">CUBIC (simplified)</option>
+      </select>
+    </label>
+    <div class="row">
+      <label>Size (MB)<input id="p-size" type="number" min="0.05" step="0.05" value="2"></label>
+      <label>rwnd (seg)<input id="p-rwnd" type="number" min="1" step="1" value="64"></label>
+      <label>MSS (B)<input id="p-mss" type="number" min="64" step="64" value="1024"></label>
+    </div>
+
+    <h2>Link presets</h2>
+    <div id="presets" class="presets"></div>
+
+    <h2>Link impairments <span class="hint">live</span></h2>
+    <div id="sliders"></div>
+
+    <h2>Export</h2>
+    <div class="export">
+      <a href="/export.csv" download>events.csv</a>
+      <a href="/export.jsonl" download>events.jsonl</a>
+      <button id="btn-png" class="ghost">charts.png</button>
+    </div>
+  </section>
+
+  <!-- ================= flow ladder ================= -->
+  <section class="panel ladder">
+    <div class="panel-head">
+      <h2>Segment flow</h2>
+      <div class="legend">
+        <span class="k data">DATA</span>
+        <span class="k ack">ACK</span>
+        <span class="k retx">retransmit</span>
+        <span class="k drop">dropped</span>
+        <span class="k ctrl">SYN / FIN</span>
+      </div>
+    </div>
+    <canvas id="cv-ladder"></canvas>
+  </section>
+
+  <!-- ================= charts + stats ================= -->
+  <section class="panel scope">
+    <div class="stat-grid" id="stats"></div>
+    <figure><figcaption>Congestion window <span>cwnd · ssthresh · rwnd — segments</span></figcaption>
+      <canvas id="cv-cwnd"></canvas></figure>
+    <figure><figcaption>Goodput <span>Mbps delivered</span></figcaption>
+      <canvas id="cv-tput"></canvas></figure>
+    <figure><figcaption>Round-trip time <span>sample · smoothed SRTT · RTO — ms</span></figcaption>
+      <canvas id="cv-rtt"></canvas></figure>
+  </section>
+</main>
+
+<script src="/app.js"></script>
+</body>
+</html>
