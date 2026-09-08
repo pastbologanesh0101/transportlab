@@ -17,7 +17,7 @@ Everything runs on one machine. No hardware, no root, no external network, no
 
 ---
 
-## 1. What it demonstrates (Computer Networks — transport layer)
+## 1. What it demonstrates (transport layer)
 
 | Concept | Where | What you see |
 |---|---|---|
@@ -81,7 +81,7 @@ python3 run.py --mux 4 --preset mobile_handoff                            # QUIC
 python3 run.py --headless        # don't open a browser
 ```
 
-### Head-less (reproducible numbers for the report)
+### Head-less (reproducible numbers)
 
 ```bash
 python3 run.py --auto --preset wifi_cafe --arq go_back_n --cc reno --size 1
@@ -159,7 +159,7 @@ formed.
 7. **Lab → loss sweep.** Measured goodput lands on the Mathis curve.
 8. **`mux 4`, `mobile_handoff`.** Toggle head-of-line blocking and re-run:
    independent stream lines vs lockstep stall.
-9. **Export** the CSV / PNG / pcap for the report.
+9. **Export** the CSV / PNG / pcap.
 
 ---
 
